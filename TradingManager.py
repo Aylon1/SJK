@@ -211,7 +211,41 @@ class BinanceTrader:
         except Exception as e:
             self.logger.error(f"Error validating order parameters: {str(e)}")
             return False
-
+            
+    async def place_limit_order(self, symbol: str, side: str, quantity: float, price: float) -> Dict:
+        """Place a limit order."""
+        try:
+            if not self._validate_order_params(symbol, side, quantity):
+                raise ValueError("Invalid order parameters")
+    
+            formatted_quantity = self.account.format_number_to_binance_precision(
+                symbol, quantity, is_price=False
+            )
+            formatted_price = self.account.format_number_to_binance_precision(
+                symbol, price, is_price=True
+            )
+    
+            order_params = {
+                'symbol': symbol,
+                'side': side,
+                'type': 'LIMIT',
+                'quantity': formatted_quantity,
+                'price': formatted_price,
+                'timeInForce': 'GTC'  # Good 'til canceled
+            }
+    
+            # Check if create_order is synchronous or asynchronous
+            if asyncio.iscoroutinefunction(self.account.client.create_order):
+                order = await self.account.client.create_order(**order_params)
+            else:
+                order = self.account.client.create_order(**order_params)
+    
+            return order
+    
+        except Exception as e:
+            self.logger.error(f"Error placing limit order: {str(e)}")
+            raise
+        
     async def place_market_order(self, symbol: str, side: str, quantity: float, max_slippage: Optional[float] = None) -> Dict:
         """Place a market order with optional slippage control."""
         try:
@@ -247,8 +281,16 @@ class BinanceTrader:
                     'type': 'MARKET',
                     'quantity': formatted_quantity
                 }
-
-            order = await self.account.client.create_order(**order_params)
+            
+            # Check if create_order is synchronous or asynchronous
+            if asyncio.iscoroutinefunction(self.account.client.create_order):
+                # If create_order is async, await it directly
+                order = await self.account.client.create_order(**order_params)
+            else:
+                # If create_order is synchronous, call it directly
+                order = self.account.client.create_order(**order_params)
+            
+            #order = await self.account.client.create_order(**order_params)
             return order
 
         except Exception as e:
@@ -349,35 +391,6 @@ class BinanceTrader:
             self.logger.error(f"Error getting open orders for {symbol}: {str(e)}")
             raise
     
-    def _calculate_ideal_limit_price_old(self, symbol: str, side: str, quantity: float, timeframe_minutes: int = 5) -> float:
-        try:
-            market_data = self.data_manager.get_market_snapshot(symbol)
-            current_price = market_data['price']
-            order_book_metrics = self.data_manager.get_order_book_metrics(symbol)
-            historical_data = self.data_manager.get_historical_data(
-                symbol, start_date=(datetime.now() - timedelta(minutes=timeframe_minutes))
-            )
-            vwap = self._calculate_vwap(historical_data)
-            atr = self._calculate_atr(symbol)
-            expected_impact = self._estimate_market_impact(symbol, quantity)
-            volatility_adjustment = atr * 0.5
-            
-            if side == 'BUY':
-                base_adjustment = -(volatility_adjustment + order_book_metrics['bid_ask_spread'] / 2)
-                if order_book_metrics['imbalance_ratio'] > 0.2: base_adjustment *= 0.8
-                ideal_price = min(current_price, vwap) + base_adjustment - expected_impact * 1.2
-            else:
-                base_adjustment = volatility_adjustment + order_book_metrics['bid_ask_spread'] / 2
-                if order_book_metrics['imbalance_ratio'] < -0.2: base_adjustment *= 0.8
-                ideal_price = max(current_price, vwap) + base_adjustment + expected_impact * 1.2
-            
-            max_deviation = current_price * 0.02
-            ideal_price = max(current_price - max_deviation, min(current_price + max_deviation, ideal_price))
-            return float(self.account.format_number_to_binance_precision(symbol, ideal_price, is_price=True))
-        except Exception as e:
-            self.logger.error(f"Error calculating ideal limit price: {str(e)}")
-            return current_price
-
     def _calculate_ideal_limit_price(self, symbol: str, side: str, quantity: float, timeframe_minutes: int = 5) -> float:
         try:
             market_data = self.data_manager.get_market_snapshot(symbol)
@@ -423,21 +436,46 @@ class BinanceTrader:
             raise
 
     async def place_limit_order_with_trailing_stop(self, symbol: str, side: str, quantity: float, callback_rate: float, allow_partial: bool = True) -> Dict:
+        """Place a limit order with a trailing stop."""
         try:
+            # Calculate the ideal limit price
             price = self._calculate_ideal_limit_price(symbol, side, quantity)
+            
+            # Validate order parameters
             if not self._validate_order_params(symbol, side, quantity, price):
                 raise ValueError("Invalid order parameters")
+            
+            # Check risk limits
             if not self._check_risk_limits(symbol, side, quantity, price):
                 raise ValueError("Order exceeds risk limits")
-
-            formatted_quantity = self.account.format_number_to_binance_precision(symbol, quantity, is_price=False)
-            formatted_price = self.account.format_number_to_binance_precision(symbol, price, is_price=True)
-
+    
+            # Format quantity and price according to Binance precision
+            formatted_quantity = self.account.format_number_to_binance_precision(
+                symbol, quantity, is_price=False
+            )
+            formatted_price = self.account.format_number_to_binance_precision(
+                symbol, price, is_price=True
+            )
+    
+            # Prepare order parameters
+            order_params = {
+                'symbol': symbol,
+                'side': side,
+                'type': 'LIMIT',
+                'timeInForce': 'GTC',  # Good 'til canceled
+                'quantity': formatted_quantity,
+                'price': formatted_price
+            }
+    
+            # Place the limit order
             with self.order_lock:
-                order = await self.account.client.create_order(
-                    symbol=symbol, side=side, type='LIMIT', timeInForce='GTC',
-                    quantity=formatted_quantity, price=formatted_price
-                )
+                # Check if create_order is synchronous or asynchronous
+                if asyncio.iscoroutinefunction(self.account.client.create_order):
+                    order = await self.account.client.create_order(**order_params)
+                else:
+                    order = self.account.client.create_order(**order_params)
+    
+                # Store the order and trailing stop details
                 order_id = order['orderId']
                 self.active_orders[order_id] = {
                     'order': order,
@@ -448,57 +486,191 @@ class BinanceTrader:
                         'allow_partial': allow_partial
                     }
                 }
+    
+                # Start monitoring the trailing stop
                 asyncio.create_task(self._monitor_trailing_stop(order_id, symbol, side))
+    
                 return order
+    
         except Exception as e:
             self.logger.error(f"Error placing limit order with trailing stop: {str(e)}")
             raise
-
+                
     async def place_scaled_order(self, symbol: str, side: str, total_quantity: float, price_range: Tuple[float, float], num_orders: int = 5, distribution: str = 'linear') -> List[Dict]:
+        """Place multiple limit orders at scaled prices."""
         try:
             start_price, end_price = price_range
             prices = np.linspace(start_price, end_price, num_orders) if distribution == 'linear' else np.geomspace(start_price, end_price, num_orders)
             quantities = [total_quantity / num_orders] * num_orders
-            return [await self.place_limit_order(symbol=symbol, side=side, quantity=qty, price=price) for price, qty in zip(prices, quantities)]
+    
+            # Place each limit order
+            orders = []
+            for price, qty in zip(prices, quantities):
+                order = await self.place_limit_order(
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    price=price
+                )
+                orders.append(order)
+    
+            return orders
+    
         except Exception as e:
             self.logger.error(f"Error placing scaled orders: {str(e)}")
             raise
 
+
     async def place_twap_order(self, symbol: str, side: str, total_quantity: float, duration_minutes: int, num_orders: int) -> Dict:
+        """Place a TWAP order."""
         try:
             quantity_per_order = total_quantity / num_orders
             interval_minutes = duration_minutes / num_orders
+    
+            # Store TWAP details
             twap_details = {
-                'symbol': symbol, 'side': side, 'total_quantity': total_quantity,
-                'executed_quantity': 0, 'orders': [],
+                'symbol': symbol,
+                'side': side,
+                'total_quantity': total_quantity,
+                'executed_quantity': 0,
+                'orders': [],
                 'start_time': datetime.now(),
                 'end_time': datetime.now() + timedelta(minutes=duration_minutes)
             }
-            asyncio.create_task(self._execute_twap(symbol, side, quantity_per_order, interval_minutes, num_orders, twap_details))
+    
+            # Start the TWAP execution task
+            asyncio.create_task(self._execute_twap(
+                symbol=symbol,
+                side=side,
+                quantity_per_order=quantity_per_order,
+                interval_minutes=interval_minutes,
+                num_orders=num_orders,
+                twap_details=twap_details
+            ))
+    
             return twap_details
+    
         except Exception as e:
             self.logger.error(f"Error setting up TWAP order: {str(e)}")
             raise
 
-    async def place_oco_order(self, symbol: str, side: str, quantity: float, price: float, stop_price: float, stop_limit_price: float) -> Dict:
+    async def _execute_twap(self, symbol: str, side: str, quantity_per_order: float, interval_minutes: float, num_orders: int, twap_details: Dict):
+        """Execute a TWAP order by placing orders at regular intervals."""
         try:
+            for i in range(num_orders):
+                # Wait for the specified interval
+                await asyncio.sleep(interval_minutes * 60)  # Convert minutes to seconds
+    
+                # Place the order
+                try:
+                    order = await self.place_limit_order(
+                        symbol=symbol,
+                        side=side,
+                        quantity=quantity_per_order,
+                        price=self.data_manager.get_market_snapshot(symbol)['price']  # Use current market price
+                    )
+                    twap_details['orders'].append(order)
+                    twap_details['executed_quantity'] += quantity_per_order
+                except Exception as e:
+                    self.logger.error(f"Error placing TWAP order {i + 1}/{num_orders}: {str(e)}")
+    
+        except Exception as e:
+            self.logger.error(f"Error executing TWAP order: {str(e)}")
+
+    async def place_oco_order(self, symbol: str, side: str, quantity: float, price: float, stop_price: float, stop_limit_price: float) -> Dict:
+        """Place an OCO (One-Cancels-the-Other) order."""
+        try:
+            # Get the current market price
+            market_price = self.data_manager.get_market_snapshot(symbol)['price']
+            self.logger.info(f"Current market price for {symbol}: {market_price}")
+    
+            # Retrieve symbol filters
+            symbol_info = self.account.client.get_symbol_info(symbol)
+            if not symbol_info:
+                raise ValueError(f"Symbol {symbol} not found")
+    
+            price_filter = next(filter(lambda x: x['filterType'] == 'PRICE_FILTER', symbol_info['filters']))
+            min_price = float(price_filter['minPrice'])
+            max_price = float(price_filter['maxPrice'])
+            tick_size = float(price_filter['tickSize'])
+    
+            self.logger.info(f"Symbol filters for {symbol}: minPrice={min_price}, maxPrice={max_price}, tickSize={tick_size}")
+    
+            # Validate prices against market price
+            if side == 'BUY':
+                if price >= market_price:
+                    self.logger.warning(f"Price {price} is not below market price {market_price}. Adjusting...")
+                    price = market_price * 0.99  # Set price 1% below market price
+                if stop_price <= market_price:
+                    self.logger.warning(f"Stop price {stop_price} is not above market price {market_price}. Adjusting...")
+                    stop_price = market_price * 1.01  # Set stop price 1% above market price
+            elif side == 'SELL':
+                if price <= market_price:
+                    self.logger.warning(f"Price {price} is not above market price {market_price}. Adjusting...")
+                    price = market_price * 1.01  # Set price 1% above market price
+                if stop_price >= market_price:
+                    self.logger.warning(f"Stop price {stop_price} is not below market price {market_price}. Adjusting...")
+                    stop_price = market_price * 0.99  # Set stop price 1% below market price
+    
+            # Ensure stopLimitPrice is valid
+            if stop_limit_price <= stop_price:
+                self.logger.warning(f"Stop limit price {stop_limit_price} is not above stop price {stop_price}. Adjusting...")
+                stop_limit_price = stop_price * 1.01  # Set stop limit price 1% above stop price
+    
+            # Adjust prices to comply with symbol filters
+            def adjust_price(value: float, tick_size: float) -> float:
+                """Adjust price to comply with tick size."""
+                return round(value // tick_size * tick_size, 8)
+    
+            price = adjust_price(price, tick_size)
+            stop_price = adjust_price(stop_price, tick_size)
+            stop_limit_price = adjust_price(stop_limit_price, tick_size)
+    
+            # Ensure prices are within allowed range
+            price = max(min(price, max_price), min_price)
+            stop_price = max(min(stop_price, max_price), min_price)
+            stop_limit_price = max(min(stop_limit_price, max_price), min_price)
+    
+            self.logger.info(f"Adjusted prices: price={price}, stopPrice={stop_price}, stopLimitPrice={stop_limit_price}")
+    
+            # Validate order parameters
             if not self._validate_order_params(symbol, side, quantity, price):
                 raise ValueError("Invalid order parameters")
+    
+            # Format quantities and prices
             formatted_qty = self.account.format_number_to_binance_precision(symbol, quantity, is_price=False)
             formatted_price = self.account.format_number_to_binance_precision(symbol, price, is_price=True)
             formatted_stop = self.account.format_number_to_binance_precision(symbol, stop_price, is_price=True)
             formatted_stop_limit = self.account.format_number_to_binance_precision(symbol, stop_limit_price, is_price=True)
-            
+    
+            # Prepare OCO order parameters
+            order_params = {
+                'symbol': symbol,
+                'side': side,
+                'quantity': formatted_qty,
+                'price': formatted_price,
+                'stopPrice': formatted_stop,
+                'stopLimitPrice': formatted_stop_limit,
+                'stopLimitTimeInForce': 'GTC'
+            }
+    
+            # Place the OCO order
             with self.order_lock:
-                order = await self.account.client.create_oco_order(
-                    symbol=symbol, side=side, quantity=formatted_qty,
-                    price=formatted_price, stopPrice=formatted_stop,
-                    stopLimitPrice=formatted_stop_limit, stopLimitTimeInForce='GTC'
-                )
+                # Check if create_oco_order is synchronous or asynchronous
+                if asyncio.iscoroutinefunction(self.account.client.create_oco_order):
+                    order = await self.account.client.create_oco_order(**order_params)
+                else:
+                    order = self.account.client.create_oco_order(**order_params)
+    
+                # Store the OCO order details
                 self.active_orders[order['orderListId']] = {
-                    'order': order, 'type': 'OCO', 'status': 'NEW'
+                    'order': order,
+                    'type': 'OCO',
+                    'status': 'NEW'
                 }
+    
                 return order
+    
         except Exception as e:
             self.logger.error(f"Error placing OCO order: {str(e)}")
             raise
