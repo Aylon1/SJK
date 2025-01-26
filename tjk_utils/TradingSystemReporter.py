@@ -1,369 +1,682 @@
 import asyncio
 import logging
 from typing import Dict, Any, Optional, List
-from datetime import datetime
-import telebot
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from enum import Enum
+from collections import deque
+import json
+import pytz
 from telebot.async_telebot import AsyncTeleBot
-from tjk_utils.prep_env import get_telegram_token, get_telegram_chatId
+from tjk_utils.position_market_reporter import PositionMarketReporter
 
-class TelegramConfig:
-    def __init__(self):
+class MessagePriority(Enum):
+    CRITICAL = 0    # System errors, critical alerts
+    HIGH = 1        # Trade signals, position updates
+    MEDIUM = 2      # Risk updates, performance metrics
+    LOW = 3         # Regular status updates, market info
 
-        # Initialize monitor as None - will be set later
-        self.monitor = None
-                    
+@dataclass
+class QueuedMessage:
+    priority: MessagePriority
+    content: str
+    timestamp: datetime
+    attempts: int = 0
+    max_attempts: int = 3
+    tags: List[str] = None
+
+    def __lt__(self, other):
+        return self.priority.value < other.priority.value
+
+class MessageQueue:
+    def __init__(self, max_size: int = 1000):
+        self.queue = deque(maxlen=max_size)
+        self.processing = False
+        self._lock = asyncio.Lock()
+
+    async def put(self, message: QueuedMessage):
+        async with self._lock:
+            self.queue.append(message)
+            # Sort by priority (lower value = higher priority)
+            sorted_queue = sorted(self.queue)
+            self.queue.clear()
+            self.queue.extend(sorted_queue)
+
+    async def get(self) -> Optional[QueuedMessage]:
+        async with self._lock:
+            return self.queue.popleft() if self.queue else None
+
+    def is_empty(self) -> bool:
+        return len(self.queue) == 0
+
+class TelegramMessageHandler:
+    def __init__(self, bot_token: str, chat_id: str):
+        self.bot = AsyncTeleBot(bot_token)
+        self.chat_id = chat_id
+        self.logger = logging.getLogger(__name__)
+        self.queue = MessageQueue()
+        
+        # Throttling settings
+        self.rate_limits = {
+            MessagePriority.CRITICAL: 1,      # 1 second
+            MessagePriority.HIGH: 5,          # 5 seconds
+            MessagePriority.MEDIUM: 30,       # 30 seconds
+            MessagePriority.LOW: 60           # 60 seconds
+        }
+        self.last_sent = {priority: datetime.min for priority in MessagePriority}
+        
+        # Error handling
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 5
+        self.backoff_base = 2
+        
+        # Monitoring
+        self.stats = {
+            'messages_sent': 0,
+            'messages_failed': 0,
+            'last_success': None,
+            'last_error': None
+        }
+
+    async def start(self):
+        """Start the message processing loop."""
+        try:
+            while True:
+                if not self.queue.is_empty():
+                    message = await self.queue.get()
+                    if message:
+                        await self._process_message(message)
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            self.logger.error(f"Error in message processing loop: {e}")
+            raise
+
+    async def _process_message(self, message: QueuedMessage):
+        """Process a single message with throttling and error handling."""
+        try:
+            # Check rate limits
+            if not self._can_send(message.priority):
+                await self.queue.put(message)
+                return
+
+            # Attempt to send message
+            if await self._send_message(message):
+                self.consecutive_failures = 0
+                self.stats['messages_sent'] += 1
+                self.stats['last_success'] = datetime.now()
+                self.last_sent[message.priority] = datetime.now()
+            else:
+                await self._handle_send_failure(message)
+
+        except Exception as e:
+            self.logger.error(f"Error processing message: {e}")
+            await self._handle_send_failure(message)
+
+    async def _send_message(self, message: QueuedMessage) -> bool:
+        """Send a message through Telegram."""
+        try:
+            await self.bot.send_message(
+                chat_id=self.chat_id,
+                text=message.content,
+                parse_mode='HTML'
+            )
+            return True
+        except Exception as e:
+            self.logger.error(f"Failed to send message: {e}")
+            self.stats['messages_failed'] += 1
+            self.stats['last_error'] = str(e)
+            return False
+
+    async def _handle_send_failure(self, message: QueuedMessage):
+        """Handle message sending failures with exponential backoff."""
+        self.consecutive_failures += 1
+        
+        if message.attempts < message.max_attempts:
+            message.attempts += 1
+            backoff = self.backoff_base ** (message.attempts - 1)
+            await asyncio.sleep(backoff)
+            await self.queue.put(message)
+        else:
+            self.logger.error(f"Message failed after {message.max_attempts} attempts: {message.content}")
+
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            self.logger.critical("Too many consecutive failures. Initiating reconnection...")
+            await self._reconnect()
+
+    def _can_send(self, priority: MessagePriority) -> bool:
+        """Check if we can send a message based on rate limits."""
+        now = datetime.now()
+        last_sent = self.last_sent.get(priority, datetime.min)
+        time_since_last = (now - last_sent).total_seconds()
+        return time_since_last >= self.rate_limits[priority]
+
+    async def _reconnect(self):
+        """Attempt to reconnect the Telegram bot."""
+        try:
+            self.bot = AsyncTeleBot(self.bot._token)
+            self.consecutive_failures = 0
+            self.logger.info("Successfully reconnected Telegram bot")
+        except Exception as e:
+            self.logger.error(f"Failed to reconnect: {e}")
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current handler statistics."""
+        return {
+            **self.stats,
+            'queue_size': len(self.queue.queue),
+            'consecutive_failures': self.consecutive_failures
+        }
+
+    async def enqueue_message(self, content: str, priority: MessagePriority, tags: List[str] = None):
+        """Enqueue a new message."""
+        message = QueuedMessage(
+            priority=priority,
+            content=content,
+            timestamp=datetime.now(pytz.UTC),
+            tags=tags or []
+        )
+        await self.queue.put(message)
+
+    async def format_and_enqueue(self, 
+                               message_type: str,
+                               data: Dict[str, Any],
+                               priority: MessagePriority = MessagePriority.MEDIUM):
+        """Format and enqueue different types of messages."""
+        content = self._format_message(message_type, data)
+        if content:
+            await self.enqueue_message(content, priority, tags=[message_type])
+
+    def _format_message(self, message_type: str, data: Dict[str, Any]) -> Optional[str]:
+        """Format different types of messages."""
+        try:
+            if message_type == "trade_signal":
+                return (f"🎯 Trade Signal for {data['symbol']}\n"
+                       f"Type: {data['signal_type']}\n"
+                       f"Price: ${data['price']:.2f}\n"
+                       f"Time: {data['timestamp']}")
+                       
+            elif message_type == "position_update":
+                return (f"📊 Position Update for {data['symbol']}\n"
+                       f"Size: {data['size']}\n"
+                       f"PnL: ${data['pnl']:.2f}\n"
+                       f"ROI: {data['roi']:.2f}%")
+                       
+            elif message_type == "risk_alert":
+                return (f"⚠️ Risk Alert\n"
+                       f"Type: {data['alert_type']}\n"
+                       f"Details: {data['details']}\n"
+                       f"Action Required: {data['action']}")
+                       
+            elif message_type == "performance_update":
+                return (f"📈 Performance Update\n"
+                       f"Total PnL: ${data['total_pnl']:.2f}\n"
+                       f"Win Rate: {data['win_rate']:.1f}%\n"
+                       f"Sharpe Ratio: {data['sharpe']:.2f}")
+                       
+            elif message_type == "system_status":
+                return (f"🖥️ System Status Update\n"
+                       f"Status: {data['status']}\n"
+                       f"Active Positions: {data['active_positions']}\n"
+                       f"CPU Usage: {data['cpu_usage']}%\n"
+                       f"Memory Usage: {data['memory_usage']}%")
+                       
+            elif message_type == "error":
+                return (f"🚨 System Error\n"
+                       f"Component: {data['component']}\n"
+                       f"Error: {data['error']}\n"
+                       f"Time: {data['timestamp']}")
+                       
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error formatting message: {e}")
+            return None
+
+class TradingSystemReporter:
+    """Handles reporting of trading system events to Telegram channel."""
+    
+    def __init__(self, trading_system: 'IntegratedTradingSystem'):
+        self.trading_system = trading_system
+        self.logger = logging.getLogger(__name__)
+        self.message_handler = None
+        self._is_running = False
+        
         # Update frequencies (in minutes)
         self.update_frequencies = {
-            'market_snapshot': 60,  # hourly market updates
-            'position_update': 60,  # hourly position updates
-            'risk_update': 240,     # 4-hourly risk updates
+            'market_snapshot': 60,    # Hourly market updates
+            'position_update': 60,    # Hourly position updates
+            'risk_update': 240,       # 4-hourly risk updates
             'performance_update': 360  # 6-hourly performance updates
         }
         
-        # Only send these updates during active market hours (8:00-24:00 UTC)
-        self.market_hours = {
-            'start': 8,  # 8:00 UTC
-            'end': 24    # 24:00 UTC
+         # Track last updates with timezone-aware datetime
+        self.last_update = {
+            key: datetime.now(pytz.UTC) 
+            for key in self.update_frequencies
         }
         
-        # Message throttling
-        self.min_time_between_messages = 60  # seconds
-        self.last_message_time = {}
+        # Initialize monitoring
+        self.monitor = None
         
-        # Priority levels
-        self.priorities = {
-            'signal': 1,        # Highest priority - always send
-            'error': 1,
-            'position': 2,      # High priority
-            'risk_alert': 2,
-            'market': 3,        # Medium priority
-            'performance': 4    # Low priority - can be delayed
-        }
+        # Initialize position market reporter
+        self.position_market_reporter = PositionMarketReporter()
 
+    async def update_positions_and_markets(self):
+        """Send updates for all positions and market conditions."""
+        try:
+            if not self.message_handler:
+                self.logger.error("Message handler not initialized")
+                return
 
-    def _record_heartbeat(self, component: str):
-            """Safely record a heartbeat."""
-            if hasattr(self, 'monitor') and self.monitor is not None:
-                self.monitor.record_heartbeat(component)
-    
-    def should_send_update(self, update_type: str, last_update: datetime) -> bool:
-        """Check if an update should be sent based on frequency and market hours."""
-        now = datetime.now()
-        
-        # Always send high-priority updates
-        if update_type in ['signal', 'error']:
-            return True
+            # Get portfolio metrics
+            portfolio_metrics = self.trading_system.trader.calculate_portfolio_metrics()
             
-        # Check market hours for non-critical updates
-        current_hour = now.hour
-        if (current_hour < self.market_hours['start'] or 
-            current_hour >= self.market_hours['end']):
-            return False
+            # Send portfolio summary first
+            portfolio_message = self.position_market_reporter.format_portfolio_message(
+                positions=portfolio_metrics.get('positions', []),
+                portfolio_value=portfolio_metrics.get('total_value', 0)
+            )
+            await self.message_handler.enqueue_message(
+                portfolio_message,
+                MessagePriority.HIGH
+            )
             
-        # Check frequency
-        if update_type in self.update_frequencies:
-            minutes_since_update = (now - last_update).total_seconds() / 60
-            return minutes_since_update >= self.update_frequencies[update_type]
+            # Send individual position updates
+            for position in portfolio_metrics.get('positions', []):
+                symbol = position.get('symbol')
+                if not symbol:
+                    continue
+                    
+                # Get market data
+                market_data = self.trading_system.data_manager.get_market_snapshot(symbol)
+                if not market_data:
+                    continue
+                    
+                position_message = self.position_market_reporter.format_position_message(
+                    position=position,
+                    market_data=market_data
+                )
+                await self.message_handler.enqueue_message(
+                    position_message,
+                    MessagePriority.MEDIUM
+                )
             
-        return False
-        
-    def can_send_message(self, message_type: str) -> bool:
-        """Check if a message can be sent based on throttling rules."""
-        now = datetime.now()
-        
-        # Always allow high-priority messages
-        if self.priorities.get(message_type, 999) <= 2:
-            return True
-            
-        # Check throttling
-        if message_type in self.last_message_time:
-            seconds_since_last = (now - self.last_message_time[message_type]).total_seconds()
-            if seconds_since_last < self.min_time_between_messages:
-                return False
+            # Send market snapshots for all pairs
+            for symbol in self.trading_system.trading_pairs:
+                market_data = self.trading_system.data_manager.get_market_snapshot(symbol)
+                order_book = self.trading_system.data_manager.get_order_book_metrics(symbol)
                 
-        self.last_message_time[message_type] = now
-        return True
-
-class TradingSystemReporter:
-    """
-    Handles reporting of trading system events to Telegram channel using telebot.
-    """
-    
-    def __init__(self, trading_system: 'IntegratedTradingSystem'):
-        """
-        Initialize the reporter.
-        
-        Args:
-            trading_system: Reference to the main trading system
-        """
-        self.telegram_config = TelegramConfig()
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.INFO)
-        
-        self.trading_system = trading_system
-        self.telegram_token = get_telegram_token()
-        self.chat_id = get_telegram_chatId()
-        
-        # Initialize Telegram bot
-        self.bot = AsyncTeleBot(self.telegram_token)
-        
-        # Message formatting settings
-        self.emoji_map = {
-            'success': '✅',
-            'error': '❌',
-            'warning': '⚠️',
-            'info': 'ℹ️',
-            'long': '🟢',
-            'short': '🔴',
-            'neutral': '⚪',
-            'profit': '📈',
-            'loss': '📉'
-        }
-        
-        # Reporting settings
-        self.reporting_levels = {
-            'websocket_status': True,
-            'market_snapshots': True,
-            'strategy_updates': True,
-            'signals': True,
-            'trades': True,
-            'risk_updates': True
-        }
+                if market_data:
+                    market_message = self.position_market_reporter.format_market_message(
+                        symbol=symbol,
+                        market_data=market_data,
+                        order_book=order_book or {}
+                    )
+                    await self.message_handler.enqueue_message(
+                        market_message,
+                        MessagePriority.LOW
+                    )
+            
+            # Record heartbeat
+            if self.monitor:
+                self.monitor.record_heartbeat('telegram_reporter')
+                
+        except Exception as e:
+            self.logger.error(f"Error updating positions and markets: {e}")
+            if self.monitor:
+                self.monitor.record_heartbeat('telegram_reporter_error')
 
     async def start_reporting(self):
         """Start the reporting system."""
         try:
+            # Initialize telegram handler
+            self.message_handler = TelegramMessageHandler(
+                bot_token=self.trading_system.telegram_token,
+                chat_id=self.trading_system.telegram_chat_id
+            )
+            
+            # Start message handler
+            self._is_running = True
+            asyncio.create_task(self.message_handler.start())
+            
             # Send initial status message
-            await self.send_system_startup_message()
+            await self._send_startup_message()
             
-            # Start periodic status updates
-            asyncio.create_task(self._periodic_status_updates())
+            # Start periodic updates
+            asyncio.create_task(self._run_periodic_updates())
             
-            self.logger.info("Trading system reporter started")
+            self.logger.info("Trading system reporter started successfully")
             
         except Exception as e:
             self.logger.error(f"Error starting reporter: {e}")
+            raise
 
-    async def send_system_startup_message(self):
+    async def stop_reporting(self):
+        """Stop the reporting system."""
+        self._is_running = False
+        self.logger.info("Trading system reporter stopped")
+
+    async def _send_startup_message(self):
         """Send system startup notification."""
-        message = f"{self.emoji_map['info']} Trading System Started\n\n"
-        message += "Monitoring pairs:\n"
+        await self.message_handler.enqueue_message(
+            "🚀 Trading System Started\n\n"
+            f"Monitoring pairs: {', '.join(self.trading_system.trading_pairs)}\n"
+            f"Time: {datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+            MessagePriority.HIGH
+        )
+
+    async def _run_periodic_updates(self):
+        """Run periodic status updates."""
+        while self._is_running:
+            try:
+                now = datetime.now(pytz.UTC)
+                
+                # Check and send updates based on frequencies
+                for update_type, frequency in self.update_frequencies.items():
+                    last_update = self.last_update[update_type]
+                    if (now - last_update).total_seconds() >= frequency * 60:
+                        await self._send_update(update_type)
+                        self.last_update[update_type] = now
+                
+                if self.monitor:
+                    self.monitor.record_heartbeat('telegram_reporter')
+                
+                await asyncio.sleep(60)  # Check every minute
+                
+            except Exception as e:
+                self.logger.error(f"Error in periodic updates: {e}")
+                await asyncio.sleep(5)
+
+    async def _send_update(self, update_type: str):
+        """Send a specific type of update."""
+        try:
+            if update_type == 'market_snapshot':
+                await self._send_market_snapshot()
+            elif update_type == 'position_update':
+                await self._send_position_update()
+            elif update_type == 'risk_update':
+                await self._send_risk_update()
+            elif update_type == 'performance_update':
+                await self._send_performance_update()
+                
+        except Exception as e:
+            self.logger.error(f"Error sending {update_type}: {e}")
+
+    async def _send_market_snapshot(self):
+        """Send market snapshot for all trading pairs."""
         for pair in self.trading_system.trading_pairs:
-            message += f"• {pair}\n"
+            try:
+                snapshot = self.trading_system.data_manager.get_market_snapshot(pair)
+                if snapshot:
+                    await self.message_handler.format_and_enqueue(
+                        'market_snapshot',
+                        {
+                            'symbol': pair,
+                            'price': snapshot['price'],
+                            'change_24h': snapshot['change_24h'],
+                            'volume': snapshot['volume_24h'],
+                            'timestamp': datetime.now(pytz.UTC)
+                        },
+                        MessagePriority.LOW
+                    )
+            except Exception as e:
+                self.logger.error(f"Error getting market snapshot for {pair}: {e}")
+
+    async def _send_position_update(self):
+        """Send update on all active positions."""
+        try:
+            positions = self.trading_system.active_positions
+            for symbol, position in positions.items():
+                market_data = self.trading_system.data_manager.get_market_snapshot(symbol)
+                if market_data:
+                    current_price = market_data['price']
+                    entry_price = position.get('entry_price', current_price)
+                    size = position.get('position_size', 0)
+                    pnl = (current_price - entry_price) * size
+                    roi = (pnl / (entry_price * size)) * 100 if entry_price * size != 0 else 0
+                    
+                    await self.message_handler.format_and_enqueue(
+                        'position_update',
+                        {
+                            'symbol': symbol,
+                            'size': size,
+                            'entry_price': entry_price,
+                            'current_price': current_price,
+                            'pnl': pnl,
+                            'roi': roi,
+                            'timestamp': datetime.now(pytz.UTC)
+                        },
+                        MessagePriority.HIGH
+                    )
+        except Exception as e:
+            self.logger.error(f"Error sending position updates: {e}")
+
+    async def _send_risk_update(self):
+        """Send update on current risk metrics."""
+        try:
+            portfolio_metrics = self.trading_system.trader.calculate_portfolio_metrics()
+            risk_metrics = portfolio_metrics.get('risk_metrics', {})
+            
+            await self.message_handler.format_and_enqueue(
+                'risk_alert',
+                {
+                    'alert_type': 'Risk Metrics Update',
+                    'details': {
+                        'largest_position': f"{risk_metrics.get('largest_position_pct', 0):.1f}%",
+                        'concentration': f"{risk_metrics.get('concentration_score', 0):.2f}",
+                        'leverage': f"{risk_metrics.get('leverage_ratio', 1):.2f}x",
+                        'risk_level': risk_metrics.get('risk_level', 'unknown')
+                    },
+                    'action': self._get_risk_action(risk_metrics),
+                    'timestamp': datetime.now(pytz.UTC)
+                },
+                MessagePriority.MEDIUM
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error sending risk update: {e}")
+
+    def _get_risk_action(self, risk_metrics: Dict) -> str:
+        """Determine appropriate risk management action."""
+        risk_level = risk_metrics.get('risk_level', 'unknown')
+        actions = {
+            'very_high': "Immediate position reduction required",
+            'high': "Consider reducing exposure",
+            'medium': "Monitor positions closely",
+            'low': "Normal operation - maintain vigilance",
+            'very_low': "Consider increasing position sizes",
+            'unknown': "Check risk monitoring system"
+        }
+        return actions.get(risk_level, "Monitor system status")
+
+    async def _send_performance_update(self):
+        """Send performance metrics update."""
+        try:
+            performance = self.trading_system.trader.generate_performance_report()
+            
+            if performance.get('status') != 'no_trades':
+                summary = performance.get('summary', {})
+                await self.message_handler.format_and_enqueue(
+                    'performance_update',
+                    {
+                        'total_pnl': summary.get('total_pnl', 0),
+                        'win_rate': summary.get('winning_trades', 0) / max(summary.get('total_trades', 1), 1) * 100,
+                        'sharpe': performance.get('risk_metrics', {}).get('sharpe_ratio', 0),
+                        'timestamp': datetime.now(pytz.UTC)
+                    },
+                    MessagePriority.MEDIUM
+                )
         
-        await self.send_telegram_message(message)
-
-    async def report_websocket_status(self, status: Dict):
-        """Report websocket connection status."""
-        if not self.reporting_levels['websocket_status']:
-            return
-            
-        try:
-            emoji = self.emoji_map['success'] if status['connected'] else self.emoji_map['error']
-            message = f"{emoji} WebSocket Status Update\n\n"
-            message += f"Connected: {status['connected']}\n"
-            message += f"Active Tasks: {status.get('active_tasks', 0)}\n"
-            message += "\nSubscribed Pairs:\n"
-            
-            for pair in status.get('subscribed_pairs', []):
-                message += f"• {pair}\n"
-            
-            await self.send_telegram_message(message)
-            
         except Exception as e:
-            self.logger.error(f"Error reporting websocket status: {e}")
+            self.logger.error(f"Error sending performance update: {e}")
 
-    async def report_market_snapshot(self, pair: str, snapshot: Dict):
-        """Report market snapshot updates."""
-        if not self.reporting_levels['market_snapshots']:
-            return
-
-        # Track last update time for this pair
-        if not hasattr(self, '_last_updates'):
-            self._last_updates = {}
-            
-        last_update = self._last_updates.get(pair, datetime.min)
-
-        if not self.telegram_config.should_send_update('market_snapshot', last_update):
-            return
-
-        # Update the last update time
-        self._last_updates[pair] = datetime.now()
-            
+    async def report_trade_signal(self, symbol: str, signal_type: str, price: float):
+        """Report a new trade signal."""
         try:
-            message = f"{self.emoji_map['info']} Market Snapshot: {pair}\n\n"
-            message += f"Price: ${snapshot['price']:.2f}\n"
-            message += f"24h Change: {snapshot['change_24h']:.2f}%\n"
-            message += f"Volume: ${snapshot['volume_24h']:,.0f}\n"
-            message += f"Volatility: {snapshot['volatility']:.2f}%\n"
-            
-            await self.send_telegram_message(message)
-            
+            await self.message_handler.format_and_enqueue(
+                'trade_signal',
+                {
+                    'symbol': symbol,
+                    'signal_type': signal_type,
+                    'price': price,
+                    'timestamp': datetime.now(pytz.UTC)
+                },
+                MessagePriority.HIGH
+            )
         except Exception as e:
-            self.logger.error(f"Error reporting market snapshot: {e}")
+            self.logger.error(f"Error reporting trade signal: {e}")
 
-    async def report_strategy_signal_old(self, pair: str, signals: Dict):
-        """Report strategy signals."""
-        if not self.reporting_levels['signals']:
-            return
-            
-        try:
-            if any(signals.values()):  # Only report if there are active signals
-                message = f"{self.emoji_map['info']} Strategy Signal: {pair}\n\n"
-                
-                if signals.get('entries_long'):
-                    message += f"{self.emoji_map['long']} Long Entry Signal\n"
-                if signals.get('entries_short'):
-                    message += f"{self.emoji_map['short']} Short Entry Signal\n"
-                if signals.get('exits_long'):
-                    message += f"{self.emoji_map['neutral']} Long Exit Signal\n"
-                if signals.get('exits_short'):
-                    message += f"{self.emoji_map['neutral']} Short Exit Signal\n"
-                
-                await self.send_telegram_message(message)
-                
-        except Exception as e:
-            self.logger.error(f"Error reporting strategy signal: {e}")
-
-    async def report_strategy_signal(self, pair: str, signals: Dict):
-        """Report strategy signals."""
-        if not self.reporting_levels['signals']:
-            return
-            
-        try:
-            # Check if there are any active signals
-            has_signals = False
-            message = f"{self.emoji_map['info']} Strategy Signal: {pair}\n\n"
-            
-            # Check each signal type safely
-            if signals.get('entries_long') is not None and signals['entries_long'].iloc[-1]:
-                message += f"{self.emoji_map['long']} Long Entry Signal\n"
-                has_signals = True
-                
-            if signals.get('entries_short') is not None and signals['entries_short'].iloc[-1]:
-                message += f"{self.emoji_map['short']} Short Entry Signal\n"
-                has_signals = True
-                
-            if signals.get('exits_long') is not None and signals['exits_long'].iloc[-1]:
-                message += f"{self.emoji_map['neutral']} Long Exit Signal\n"
-                has_signals = True
-                
-            if signals.get('exits_short') is not None and signals['exits_short'].iloc[-1]:
-                message += f"{self.emoji_map['neutral']} Short Exit Signal\n"
-                has_signals = True
-            
-            # Only send message if there are active signals
-            if has_signals:
-                await self.send_telegram_message(message)
-                
-        except Exception as e:
-            self.logger.error(f"Error reporting strategy signal: {e}")
-    
-    async def report_trade_execution(self, trade: Dict):
-        """Report trade execution details."""
-        if not self.reporting_levels['trades']:
-            return
-            
-        try:
-            side_emoji = self.emoji_map['long'] if trade['side'] == 'BUY' else self.emoji_map['short']
-            message = f"{side_emoji} Trade Executed: {trade['symbol']}\n\n"
-            message += f"Side: {trade['side']}\n"
-            message += f"Price: ${float(trade['price']):.2f}\n"
-            message += f"Quantity: {float(trade['quantity']):.8f}\n"
-            message += f"Value: ${float(trade['price']) * float(trade['quantity']):.2f}\n"
-            
-            await self.send_telegram_message(message)
-            
-        except Exception as e:
-            self.logger.error(f"Error reporting trade execution: {e}")
-
-    async def report_risk_update(self, metrics: Dict):
-        """Report risk metric updates."""
-        if not self.reporting_levels['risk_updates']:
-            return
-            
-        try:
-            risk_level = metrics['risk_metrics']['risk_level']
-            emoji = self.emoji_map['warning'] if risk_level in ['high', 'very_high'] else self.emoji_map['info']
-            
-            message = f"{emoji} Risk Update\n\n"
-            message += f"Risk Level: {risk_level}\n"
-            message += f"Exposure: {metrics['exposure_metrics']['gross_exposure']:.2f}%\n"
-            message += f"Largest Position: {metrics['risk_metrics']['largest_position_pct']:.2f}%\n"
-            
-            await self.send_telegram_message(message)
-            
-        except Exception as e:
-            self.logger.error(f"Error reporting risk update: {e}")
-
-    async def report_performance_summary(self, summary: Dict):
-        """Report periodic performance summary."""
-        try:
-            pnl = summary['trading_performance']['total_pnl']
-            emoji = self.emoji_map['profit'] if pnl >= 0 else self.emoji_map['loss']
-            
-            message = f"{emoji} Performance Summary\n\n"
-            message += f"Total PnL: ${pnl:.2f}\n"
-            message += f"Total Trades: {summary['trading_performance']['total_trades']}\n"
-            message += f"Win Rate: {summary['trading_performance']['winning_trades'] / max(1, summary['trading_performance']['total_trades']) * 100:.1f}%\n"
-            
-            await self.send_telegram_message(message)
-            
-        except Exception as e:
-            self.logger.error(f"Error reporting performance summary: {e}")
-
-    async def report_error(self, error_type: str, error_message: str):
+    async def report_error(self, component: str, error: str):
         """Report system errors."""
         try:
-            message = f"{self.emoji_map['error']} System Error\n\n"
-            message += f"Type: {error_type}\n"
-            message += f"Message: {error_message}\n"
-            
-            await self.send_telegram_message(message)
-            
+            await self.message_handler.format_and_enqueue(
+                'error',
+                {
+                    'component': component,
+                    'error': str(error),
+                    'timestamp': datetime.now(pytz.UTC)
+                },
+                MessagePriority.CRITICAL
+            )
         except Exception as e:
             self.logger.error(f"Error reporting system error: {e}")
 
-    async def _periodic_status_updates(self):
-        """Send periodic status updates."""
-        while True:
-            try:
-                # Get system status
-                status = self.trading_system.get_system_status()
-                
-                # Report websocket status
-                await self.report_websocket_status(status['data_manager_status'])
-                
-                # Report performance
-                performance = self.trading_system.get_performance_summary()
-                await self.report_performance_summary(performance)
-                
-                # Wait for next update interval (e.g., every hour)
-                await asyncio.sleep(3600)
-                
-            except Exception as e:
-                self.logger.error(f"Error in periodic status updates: {e}")
-                await asyncio.sleep(60)
+    async def report_websocket_status(self, status: Dict[str, Any]):
+        """Report websocket connection status."""
+        try:
+            await self.message_handler.format_and_enqueue(
+                'system_status',
+                {
+                    'status': 'WEBSOCKET UPDATE',
+                    'connected': status.get('connected', False),
+                    'active_pairs': len(status.get('subscribed_pairs', [])),
+                    'last_update': status.get('last_update', {}),
+                    'cpu_usage': 0,  # Add system metrics if available
+                    'memory_usage': 0
+                },
+                MessagePriority.HIGH if not status.get('connected', False) else MessagePriority.MEDIUM
+            )
+        except Exception as e:
+            self.logger.error(f"Error reporting websocket status: {e}")
 
-    async def send_telegram_message(self, message: str):
-        """Send message to Telegram channel with retry logic."""
-        max_retries = 3
-        retry_delay = 5  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=message,
-                    parse_mode='HTML'
+    def get_reporter_status(self) -> Dict[str, Any]:
+        """Get current reporter status and statistics."""
+        try:
+            if not self.message_handler:
+                return {'status': 'not_initialized'}
+                
+            stats = self.message_handler.get_stats()
+            return {
+                'status': 'running' if self._is_running else 'stopped',
+                'message_stats': stats,
+                'last_updates': {k: v.isoformat() for k, v in self.last_update.items()},
+                'monitoring_pairs': len(self.trading_system.trading_pairs)
+            }
+        except Exception as e:
+            self.logger.error(f"Error getting reporter status: {e}")
+            return {'status': 'error', 'error': str(e)}
+
+    async def report_positions(self):
+        """Report all active positions."""
+        try:
+            # Get all active positions
+            positions = self.trading_system.active_positions
+            if not positions:
+                await self.message_handler.enqueue_message(
+                    "No active positions currently.",
+                    MessagePriority.LOW
                 )
                 return
-            except Exception as e:
-                if attempt == max_retries - 1:  # Last attempt
-                    self.logger.error(f"Failed to send Telegram message after {max_retries} attempts: {e}")
-                else:
-                    await asyncio.sleep(retry_delay * (attempt + 1))
-
-# Usage example:
-# reporter = TradingSystemReporter(trading_system)
-# await reporter.start_reporting()
+    
+            # Get portfolio metrics
+            portfolio_metrics = self.trading_system.trader.calculate_portfolio_metrics()
+            total_value = portfolio_metrics.get('total_value', 0)
+            daily_pnl = portfolio_metrics.get('pnl_24h', 0)
+    
+            # First send portfolio summary
+            summary = await PositionReporter.format_portfolio_summary(
+                positions, total_value, daily_pnl
+            )
+            await self.message_handler.enqueue_message(
+                summary,
+                MessagePriority.HIGH
+            )
+    
+            # Then send individual position reports
+            for symbol, position in positions.items():
+                # Get market data for the position
+                market_data = self.trading_system.data_manager.get_market_snapshot(symbol)
+                if not market_data:
+                    continue
+    
+                position_report = await PositionReporter.format_position_report(
+                    position, market_data
+                )
+                await self.message_handler.enqueue_message(
+                    position_report,
+                    MessagePriority.MEDIUM
+                )
+    
+        except Exception as e:
+            self.logger.error(f"Error reporting positions: {e}")
+            await self.report_error("position_reporter", str(e))
+    
+    async def report_market_snapshot(self, symbol: str = None):
+        """Report market snapshot for one or all symbols."""
+        try:
+            symbols = [symbol] if symbol else self.trading_system.trading_pairs
+            
+            for sym in symbols:
+                try:
+                    # Get market data
+                    market_data = self.trading_system.data_manager.get_market_snapshot(sym)
+                    if not market_data:
+                        continue
+    
+                    # Get order book metrics
+                    order_book = self.trading_system.data_manager.get_order_book_metrics(sym)
+                    if not order_book:
+                        order_book = {}
+    
+                    # Format and send snapshot
+                    snapshot = await PositionReporter.format_market_snapshot(
+                        sym, market_data, order_book
+                    )
+                    await self.message_handler.enqueue_message(
+                        snapshot,
+                        MessagePriority.LOW
+                    )
+    
+                except Exception as e:
+                    self.logger.error(f"Error reporting market snapshot for {sym}: {e}")
+    
+        except Exception as e:
+            self.logger.error(f"Error in report_market_snapshot: {e}")
+            await self.report_error("market_reporter", str(e))
+    
+    # Usage in the trading system:
+    async def report_status(self):
+        """Report complete system status."""
+        try:
+            # First report positions
+            await self.report_positions()
+            
+            # Then report market snapshots
+            await self.report_market_snapshot()
+            
+            # Get system metrics
+            metrics = self.trading_system.get_system_status()
+            
+            # Report system status
+            await self.message_handler.enqueue_message(
+                f"System Status:\n"
+                f"Websocket Connected: {metrics['websocket_connected']}\n"
+                f"Active Tasks: {metrics['active_tasks']}\n"
+                f"Memory Usage: {metrics['memory_usage']}MB\n"
+                f"Last Update: {datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+                MessagePriority.HIGH
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error reporting system status: {e}")
+            await self.report_error("status_reporter", str(e))
