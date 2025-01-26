@@ -22,21 +22,8 @@ class EMACrossStrategy:
         self._exits_short = None
         self._last_update = None
 
-    def _record_heartbeat(self, component: str):
-            """Safely record a heartbeat."""
-            if hasattr(self, 'monitor') and self.monitor is not None:
-                self.monitor.record_heartbeat(component)
-    
     def update(self, data_vbt: vbt.Data) -> bool:
-        """
-        Update strategy with new data and calculate signals.
-        
-        Args:
-            data_vbt: VectorBT Data object with price data
-            
-        Returns:
-            bool: Success status
-        """
+        """Update strategy with new data and calculate signals."""
         try:
             if data_vbt is None:
                 self.logger.error("No data provided for strategy update")
@@ -54,13 +41,14 @@ class EMACrossStrategy:
     def _calculate_signals(self):
         """Calculate EMAs and entry/exit signals."""
         try:
-            # Record heartbeat for strategy calculations
-            self.monitor.record_heartbeat('strategy')
-            
+            # Optional heartbeat recording if monitor exists
+            if self.monitor is not None:
+                self.monitor.record_heartbeat('strategy')
+
             if self.data_ is None:
                 return
 
-            # Calculate EMAs for different timeframes
+            # Calculate EMAs for different timeframes - keep your original working code
             mas = vbt.talib("EMA").run(
                 self.data_.get("Close"), 
                 skipna=True,
