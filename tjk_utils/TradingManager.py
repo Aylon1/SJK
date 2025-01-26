@@ -16,7 +16,7 @@ class BinanceTrader:
         self.account, self.data_manager = account, data_manager
         self.lock = threading.Lock()
         self.config = {
-            'max_position_size': 0.1, 'max_single_order_size': 0.05,
+            'max_position_size': 0.5, 'max_single_order_size': 0.5,
             'min_order_size_usdt': 10.0, 'default_stop_loss_pct': 0.02,
             'default_take_profit_pct': 0.04, 'max_slippage_pct': 0.001,
             'volatility_thresholds': {'low': 0.5, 'medium': 2.0},
